@@ -53,6 +53,7 @@
     if (p.get('category')) state.category = p.get('category');
     if (p.get('chain')) state.chain = p.get('chain');
     if (p.get('method')) state.method = true;
+    if (p.get('farm')) state.farm = true;
   }
   function writeHash() {
     var p = new URLSearchParams();
@@ -177,7 +178,7 @@
         el('div', null, el('span', { text: 'Implied value' }), el('b', { class: 'num', text: fmtUsd(row.implied_value_usd) })),
         el('div', null, el('span', { text: 'Farm cost in total' }), el('b', { class: 'num', text: farmTotal(row) + ' of gas' }))),
       el('p', { class: 'sub', text: 'Model ' + DATA.model_version + ': the page recomputes this row as ' + fmtUsd(recomputed) + (recomputed === row.implied_value_usd ? ', the same number board.json carries.' : ', which differs from the board.') + ' This is an estimate, not a price.' })));
-    dialog.appendChild(el('section', { class: 'detail-section' },
+    dialog.appendChild(el('section', { class: 'detail-section', id: 'farm-plan' },
       el('h3', { text: 'Farm plan — ' + row.farm_steps.length + ' steps, costed' }),
       el('ol', { class: 'steps' }, (row.farm_steps || []).map(function (s) {
         var at = s.indexOf(' Cost: ');
@@ -185,6 +186,10 @@
       }))));
     if (typeof dialog.showModal === 'function' && !dialog.open) dialog.showModal();
     else dialog.setAttribute('open', '');
+    if (state.farm) {
+      var fp = dialog.querySelector('#farm-plan');
+      if (fp) fp.scrollIntoView();
+    }
   }
   function render() {
     app.textContent = '';
