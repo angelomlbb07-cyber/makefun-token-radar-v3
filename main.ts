@@ -1,9 +1,10 @@
-// Token radar entry, radar-3 (Node 22/24, standard library only).
-// Reads /input/snapshot.json (or --input), fits the size curve and validates
-// it with lib/model.ts, writes /output/board.json, /output/data.js, copies
-// dashboard/ and screenshots/ to /output, writes the runtime research note
-// into the dashboard copy, and writes /output/dossier.json via vendor.
-// Run locally: mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts --input ../token-radar-01-kit-v2/token-radar-01-kit/input/snapshot.json
+// Token radar entry, radar-4 (Node 22/24, standard library only).
+// Reads /input/snapshot.json (or --input), fits the size-plus-chains curve
+// and validates it with lib/model.ts, writes /output/board.json,
+// /output/data.js, copies dashboard/ and screenshots/ to /output, writes the
+// runtime research note into the dashboard copy, and writes
+// /output/dossier.json via vendor.
+// Run locally: mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts --input ../token-radar-01-kit-v3/input/snapshot.json
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -24,7 +25,7 @@ function arg(name: string, fallback: string): string {
 const inputArg = arg('input', '/input');
 const inputFile = inputArg.endsWith('.json') ? inputArg : join(inputArg, 'snapshot.json');
 if (!existsSync(inputFile)) {
-  process.stderr.write(`radar-3: no snapshot at ${inputFile}\n`);
+  process.stderr.write(`radar-4: no snapshot at ${inputFile}\n`);
   process.exit(2);
 }
 const out = arg('output', process.env.MAKEFUN_OUTPUT_DIR ?? '/output');
@@ -32,7 +33,7 @@ const snapshot = parseSnapshot(readFileSync(inputFile, 'utf8'));
 const { board, radar, validation } = buildRadar(snapshot);
 const issue = boardIssue(board, snapshot);
 if (issue !== null) {
-  process.stderr.write(`radar-3: board refused: ${issue}\n`);
+  process.stderr.write(`radar-4: board refused: ${issue}\n`);
   process.exit(1);
 }
 mkdirSync(out, { recursive: true });
@@ -55,12 +56,12 @@ function copyDir(from: string, to: string): string[] {
 const dash = copyDir(join(here, 'dashboard'), join(out, 'dashboard'));
 const shots = copyDir(join(here, 'screenshots'), join(out, 'screenshots'));
 if (shots.length < 3) {
-  process.stderr.write(`radar-3: screenshots/ holds ${shots.length} images: need 3\n`);
+  process.stderr.write(`radar-4: screenshots/ holds ${shots.length} images: need 3\n`);
   process.exit(1);
 }
 for (const name of shots) {
   if (!IMAGE_NAME.test(name)) {
-    process.stderr.write(`radar-3: bad screenshot name ${name}\n`);
+    process.stderr.write(`radar-4: bad screenshot name ${name}\n`);
     process.exit(1);
   }
 }
@@ -73,9 +74,11 @@ writeFileSync(join(out, 'dossier.json'), buildDossier(out, {
   dashboard: { max_files: 400, max_bytes: 4_194_304 },
 }));
 process.stdout.write(
-  `radar-3: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} watchlist, ${board.length} rows\n` +
-  `radar-3: fit log10(mcap) = ${validation.size_curve.a.toFixed(3)} + ${validation.size_curve.b.toFixed(3)} * log10(TVL) on ${validation.comps} comps\n` +
-  `radar-3: CV median x${validation.cv.median_factor.toFixed(2)} (${Math.round(validation.cv.within_2x * 100)}% within 2x), time split median x${validation.time_split.median_factor.toFixed(2)} (${Math.round(validation.time_split.within_2x * 100)}% within 2x)\n` +
-  `radar-3: growth/age ${validation.growth_age_included ? 'kept' : 'dropped'}\n` +
-  `radar-3: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, dashboard (${dash.length + 1} files), screenshots (${shots.length}), ${join(out, 'dossier.json')}\n`,
+  `radar-4: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} watchlist, ${board.length} rows\n` +
+  `radar-4: fit log10(mcap) = ${validation.model.a.toFixed(3)} + ${validation.model.b.toFixed(3)} * log10(TVL) + ${validation.model.c.toFixed(3)} * log1p(chains) on ${validation.comps} comps\n` +
+  `radar-4: CV median x${validation.cv.median_factor.toFixed(2)} (${Math.round(validation.cv.within_2x * 100)}% within 2x), time split median x${validation.time_split.median_factor.toFixed(2)} (${Math.round(validation.time_split.within_2x * 100)}% within 2x), reverse time split x${validation.reverse_time_split.median_factor.toFixed(2)} (${Math.round(validation.reverse_time_split.within_2x * 100)}% within 2x)\n` +
+  `radar-4: bootstrap ${validation.bootstrap.n} resamples, chains coef ${validation.bootstrap.c.p5.toFixed(3)} to ${validation.bootstrap.c.p95.toFixed(3)}\n` +
+  `radar-4: growth/age ${validation.growth_age_included ? 'kept' : 'dropped'}\n` +
+  `radar-4: verdicts FARM ${radar.verdict_counts.FARM}, THIN ${radar.verdict_counts.THIN}, SKIP ${radar.verdict_counts.SKIP}\n` +
+  `radar-4: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, dashboard (${dash.length + 1} files), screenshots (${shots.length}), ${join(out, 'dossier.json')}\n`,
 );

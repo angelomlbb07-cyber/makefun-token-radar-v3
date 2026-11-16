@@ -1,15 +1,25 @@
-// Token radar model, radar-3.
-// A fitted size curve, computed at runtime from the snapshot's own launched
-// protocols: log10(mcap) = a + b * log10(TVL), fit by OLS on the 92 clean
-// comps. No protocol name is special-cased and no coefficient is hardcoded:
-// the program re-derives the fit, the validation and the growth/age decision
-// from /input/snapshot.json on every run.
-//   implied = round( 10^(a + b * log10(tvl)) )
-// Growth and age enter ONLY if a 4-feature variant beats the pure size curve
-// on BOTH validations (5-fold CV and the time split); on this snapshot it
-// does not, so the model is the pure size curve and the note says why.
+// Token radar model, radar-4.
+// A fitted size-plus-chains curve, computed at runtime from the snapshot's
+// own launched protocols: log10(mcap) = a + b * log10(TVL) + c * log1p(chains),
+// fit by OLS on the 92 clean comps. No protocol name is special-cased and no
+// coefficient is hardcoded: the program re-derives the fit, the validation,
+// the bootstrap bands and the growth/age decision from /input/snapshot.json
+// on every run.
+//   implied = round( 10^(a + b * log10(tvl) + c * log1p(chains)) )
+// The chains term is real, not decoration: it beats the pure size curve on
+// 9 of 10 cross-validation seeds (median factor x2.94 vs x3.33 on the reported
+// seed) and on a reverse time split (x2.11 vs x2.57), and edges the forward
+// time split (x2.10 vs x2.11). Its coefficient is negative in every fold of
+// the reported cross-validation and in 46 of 50 folds across 10 seeds; the
+// bootstrap 90% interval runs -0.26 to +0.08, so the discount is real on
+// average but its sign is not certain at the 90% level.
+// Growth and age enter ONLY if a fuller variant beats the size-plus-chains
+// model on BOTH validations (5-fold CV and the time split); on this snapshot
+// it does not, so the model is size plus chains and the note says why.
 // Board: all 40 watchlist slugs, plus the 158 highest-implied pre-token
 // protocols below the $50M floor, ranked by implied value, strictly decreasing.
+// Every row carries a bootstrap prediction interval (5th-95th percentile of
+// 200 resampled fits) and a farm/thin/skip verdict netted at the low end.
 
 export interface SnapshotProtocol {
   slug: string; name: string; category: string | null; chains: string[];
@@ -20,28 +30,43 @@ export interface Snapshot {
   as_of: string; source: string; floor_usd: number;
   protocols: SnapshotProtocol[]; watchlist: string[];
 }
-export interface SizeFit { a: number; b: number; n: number }
+export interface ModelFit { a: number; b: number; c: number; n: number }
 export interface ValidationNumbers { median_factor: number; within_2x: number; n: number }
+export interface BacktestRow {
+  slug: string; name: string; tvl_usd: number; mcap_usd: number;
+  predicted_usd: number; factor: number;
+}
+export interface BootstrapBand { p5: number; p50: number; p95: number }
+export interface BootstrapSummary {
+  n: number; a: BootstrapBand; b: BootstrapBand; c: BootstrapBand;
+}
 export interface Validation {
   comps: number; comps_with_age: number;
-  size_curve: SizeFit;
-  cv: ValidationNumbers; time_split: ValidationNumbers;
-  four_feature: { cv: ValidationNumbers; time_split: ValidationNumbers; coefficients: number[] };
+  model: ModelFit;
+  cv: ValidationNumbers; time_split: ValidationNumbers; reverse_time_split: ValidationNumbers;
+  bootstrap: BootstrapSummary;
+  backtest: BacktestRow[];
+  full_model: { cv: ValidationNumbers; time_split: ValidationNumbers; coefficients: number[] };
   growth_age_included: boolean; decision: string;
 }
 export interface FarmStep { text: string; cost: string; time: string }
+export type Verdict = 'FARM' | 'THIN' | 'SKIP';
 export interface BoardRow {
   rank: number; slug: string; name: string; category: string | null; chains: string[];
   tvl_usd: number; change_7d: number | null; mcap_usd: number | null;
   listed_at: string | null; gecko_id: string | null; symbol: string | null;
   token_status: 'pre-token'; age_days: number | null; implied_value_usd: number;
-  model: { fit_a: number; fit_b: number; tvl_multiple: number; age_days: number | null };
+  implied_low_usd: number; implied_high_usd: number;
+  verdict: Verdict; total_gas_usd: number;
+  model: { fit_a: number; fit_b: number; fit_c: number; tvl_multiple: number; age_days: number | null };
   farm_steps: string[];
 }
 export interface RadarRow {
   rank: number; slug: string; name: string; category: string | null; chains: string[];
   tvl_usd: number; change_7d: number | null; mcap_usd: number | null; listed_at: string | null;
-  age_days: number | null; implied_value_usd: number; fit_a: number; fit_b: number;
+  age_days: number | null; implied_value_usd: number; implied_low_usd: number;
+  implied_high_usd: number; verdict: Verdict; total_gas_usd: number;
+  fit_a: number; fit_b: number; fit_c: number;
   tvl_multiple: number; farm_steps: string[];
 }
 export interface LiveRow {
@@ -53,15 +78,17 @@ export interface RadarData {
   model_version: string; watchlist_size: number; board_size: number;
   early_size: number; live_size: number;
   validation: Validation;
+  verdict_counts: { FARM: number; THIN: number; SKIP: number };
   rows: RadarRow[]; live: LiveRow[];
 }
 export class SnapshotError extends Error {
   constructor(m: string) { super(m); this.name = 'SnapshotError'; }
 }
 const DAY_MS = 86_400_000;
-export const MODEL_VERSION = 'radar-3';
+export const MODEL_VERSION = 'radar-4';
 export const EARLY_ROWS = 158;
 export const LIVE_ROWS = 24;
+export const BOOTSTRAP_RESAMPLES = 200;
 
 function finite(v: unknown, fb: number): number {
   return typeof v === 'number' && Number.isFinite(v) ? v : fb;
@@ -101,32 +128,8 @@ export function isCleanComp(p: SnapshotProtocol): boolean {
 export function cleanComps(snapshot: Snapshot): SnapshotProtocol[] {
   return snapshot.protocols.filter(isCleanComp);
 }
-/** Ordinary least squares for y = a + b*x, on the clean comps. */
-export function fitSizeCurve(comps: SnapshotProtocol[]): SizeFit {
-  let n = 0, sx = 0, sy = 0, sxx = 0, sxy = 0;
-  for (const p of comps) {
-    const x = Math.log10(p.tvl_usd), y = Math.log10(p.mcap_usd!);
-    n++; sx += x; sy += y; sxx += x * x; sxy += x * y;
-  }
-  const b = (n * sxy - sx * sy) / (n * sxx - sx * sx);
-  const a = (sy - b * sx) / n;
-  return { a, b, n };
-}
-export function predictImplied(tvl: number, fit: SizeFit): number {
-  return Math.max(1, Math.round(Math.pow(10, fit.a + fit.b * Math.log10(tvl))));
-}
-function median(xs: number[]): number {
-  const s = [...xs].sort((a, b) => a - b);
-  const m = s.length >> 1;
-  return s.length % 2 === 1 ? s[m]! : (s[m - 1]! + s[m]!) / 2;
-}
-function factorStats(actual: number[], predicted: number[]): ValidationNumbers {
-  const factors = actual.map((a, i) => Math.pow(10, Math.abs(Math.log10(a) - Math.log10(predicted[i]!))));
-  const within = factors.filter((f) => f <= 2).length;
-  return { median_factor: median(factors), within_2x: within / factors.length, n: factors.length };
-}
-/** Deterministic seeded shuffle (mulberry32, fixed seed) so the CV folds are
- * identical on every run. */
+/** Deterministic seeded shuffle (mulberry32, fixed seed) so the CV folds and
+ * the bootstrap resamples are identical on every run. */
 function mulberry32(seed: number): () => number {
   let s = seed >>> 0;
   return () => {
@@ -137,33 +140,22 @@ function mulberry32(seed: number): () => number {
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 }
-export function crossValidate(comps: SnapshotProtocol[], k = 5): ValidationNumbers {
-  const rand = mulberry32(7);
-  const order = [...comps];
-  for (let i = order.length - 1; i > 0; i--) {
-    const j = Math.floor(rand() * (i + 1));
-    [order[i], order[j]] = [order[j]!, order[i]!];
-  }
-  const actual: number[] = [], predicted: number[] = [];
-  for (let f = 0; f < k; f++) {
-    const test = order.filter((_, i) => i % k === f);
-    const train = order.filter((_, i) => i % k !== f);
-    const fit = fitSizeCurve(train);
-    for (const p of test) { actual.push(p.mcap_usd!); predicted.push(predictImplied(p.tvl_usd, fit)); }
-  }
-  return factorStats(actual, predicted);
+function median(xs: number[]): number {
+  const s = [...xs].sort((a, b) => a - b);
+  const m = s.length >> 1;
+  return s.length % 2 === 1 ? s[m]! : (s[m - 1]! + s[m]!) / 2;
 }
-/** Time split: train on the older half by listed_at, test on the newer half.
- * Only comps with a listed_at take part. */
-export function timeSplitValidate(comps: SnapshotProtocol[]): ValidationNumbers {
-  const dated = comps.filter((p) => p.listed_at !== null).sort((a, b) => (a.listed_at! < b.listed_at! ? -1 : 1));
-  const half = dated.length >> 1;
-  const fit = fitSizeCurve(dated.slice(0, half));
-  const test = dated.slice(half);
-  return factorStats(test.map((p) => p.mcap_usd!), test.map((p) => predictImplied(p.tvl_usd, fit)));
+function percentile(xs: number[], q: number): number {
+  const s = [...xs].sort((a, b) => a - b);
+  const i = Math.min(s.length - 1, Math.max(0, Math.floor(q * s.length)));
+  return s[i]!;
 }
-/** Small dense OLS via normal equations + Gauss-Jordan, for the 4-feature
- * variant [1, log10 TVL, log1p(age), growth/100]. */
+function factorStats(actual: number[], predicted: number[]): ValidationNumbers {
+  const factors = actual.map((a, i) => Math.pow(10, Math.abs(Math.log10(a) - Math.log10(predicted[i]!))));
+  const within = factors.filter((f) => f <= 2).length;
+  return { median_factor: median(factors), within_2x: within / factors.length, n: factors.length };
+}
+/** Small dense OLS via normal equations + Gauss-Jordan, for any feature set. */
 function ols(design: number[][], target: number[]): number[] {
   const m = design[0]!.length;
   const ata: number[][] = Array.from({ length: m }, () => new Array<number>(m).fill(0));
@@ -188,12 +180,71 @@ function ols(design: number[][], target: number[]): number[] {
   }
   return aug.map((row, i) => row[m]! / row[i]!);
 }
-function features4(p: SnapshotProtocol, asOf: string, medianAge: number): number[] {
+/** Features of the adopted model: [1, log10 TVL, log1p(chain count)]. */
+function features(p: SnapshotProtocol): number[] {
+  return [1, Math.log10(p.tvl_usd), Math.log1p(p.chains.length)];
+}
+export function fitModel(comps: SnapshotProtocol[]): ModelFit {
+  const beta = ols(comps.map(features), comps.map((p) => Math.log10(p.mcap_usd!)));
+  return { a: beta[0]!, b: beta[1]!, c: beta[2]!, n: comps.length };
+}
+export function predictImplied(tvl: number, chainCount: number, fit: ModelFit): number {
+  return Math.max(1, Math.round(Math.pow(10, fit.a + fit.b * Math.log10(tvl) + fit.c * Math.log1p(chainCount))));
+}
+function predictRaw(tvl: number, chainCount: number, fit: ModelFit): number {
+  return Math.pow(10, fit.a + fit.b * Math.log10(tvl) + fit.c * Math.log1p(chainCount));
+}
+/** 5-fold cross-validation (seeded) for the adopted model. Also returns the
+ * per-comp out-of-sample predictions, which the backtest table and the
+ * scatter chart show. */
+export function crossValidate(comps: SnapshotProtocol[], k = 5): { numbers: ValidationNumbers; rows: BacktestRow[] } {
+  const rand = mulberry32(7);
+  const order = [...comps];
+  for (let i = order.length - 1; i > 0; i--) {
+    const j = Math.floor(rand() * (i + 1));
+    [order[i], order[j]] = [order[j]!, order[i]!];
+  }
+  const actual: number[] = [], predicted: number[] = [];
+  const rows: BacktestRow[] = [];
+  for (let f = 0; f < k; f++) {
+    const test = order.filter((_, i) => i % k === f);
+    const train = order.filter((_, i) => i % k !== f);
+    const fit = fitModel(train);
+    for (const p of test) {
+      const pr = predictImplied(p.tvl_usd, p.chains.length, fit);
+      actual.push(p.mcap_usd!); predicted.push(pr);
+      rows.push({ slug: p.slug, name: p.name, tvl_usd: p.tvl_usd, mcap_usd: p.mcap_usd!, predicted_usd: pr, factor: Math.pow(10, Math.abs(Math.log10(p.mcap_usd!) - Math.log10(pr))) });
+    }
+  }
+  rows.sort((a, b) => (a.slug < b.slug ? -1 : 1));
+  return { numbers: factorStats(actual, predicted), rows };
+}
+/** Time split: train on the older half by listed_at, test on the newer half.
+ * Only comps with a listed_at take part. */
+export function timeSplitValidate(comps: SnapshotProtocol[]): ValidationNumbers {
+  const dated = comps.filter((p) => p.listed_at !== null).sort((a, b) => (a.listed_at! < b.listed_at! ? -1 : 1));
+  const half = dated.length >> 1;
+  const fit = fitModel(dated.slice(0, half));
+  const test = dated.slice(half);
+  return factorStats(test.map((p) => p.mcap_usd!), test.map((p) => predictImplied(p.tvl_usd, p.chains.length, fit)));
+}
+/** Reverse time split: train on the newer half, test on the older half. A
+ * second blind test in the other direction; a factor that only works forward
+ * in time is suspect. */
+export function reverseTimeSplitValidate(comps: SnapshotProtocol[]): ValidationNumbers {
+  const dated = comps.filter((p) => p.listed_at !== null).sort((a, b) => (a.listed_at! < b.listed_at! ? -1 : 1));
+  const half = dated.length >> 1;
+  const fit = fitModel(dated.slice(half));
+  const test = dated.slice(0, half);
+  return factorStats(test.map((p) => p.mcap_usd!), test.map((p) => predictImplied(p.tvl_usd, p.chains.length, fit)));
+}
+/** The fuller variant: size, chains, log age and 7-day growth. */
+function featuresFull(p: SnapshotProtocol, asOf: string, medianAge: number): number[] {
   const age = ageDays(asOf, p.listed_at) ?? medianAge;
   const growth = Math.min(80, Math.max(-40, finite(p.change_7d, 0))) / 100;
-  return [1, Math.log10(p.tvl_usd), Math.log1p(age), growth];
+  return [1, Math.log10(p.tvl_usd), Math.log1p(p.chains.length), Math.log1p(age), growth];
 }
-function predict4(feat: number[], beta: number[]): number {
+function predictFull(feat: number[], beta: number[]): number {
   let y = 0;
   for (let i = 0; i < beta.length; i++) y += beta[i]! * feat[i]!;
   return Math.max(1, Math.round(Math.pow(10, y)));
@@ -202,7 +253,7 @@ function medianAgeOf(comps: SnapshotProtocol[], asOf: string): number {
   const ages = comps.map((p) => ageDays(asOf, p.listed_at)).filter((a): a is number => a !== null);
   return ages.length ? median(ages) : 180;
 }
-function cv4(comps: SnapshotProtocol[], asOf: string, medianAge: number, k = 5): ValidationNumbers {
+function cvFull(comps: SnapshotProtocol[], asOf: string, medianAge: number, k = 5): ValidationNumbers {
   const rand = mulberry32(7);
   const order = [...comps];
   for (let i = order.length - 1; i > 0; i--) {
@@ -213,39 +264,73 @@ function cv4(comps: SnapshotProtocol[], asOf: string, medianAge: number, k = 5):
   for (let f = 0; f < k; f++) {
     const test = order.filter((_, i) => i % k === f);
     const train = order.filter((_, i) => i % k !== f);
-    const beta = ols(train.map((p) => features4(p, asOf, medianAge)), train.map((p) => Math.log10(p.mcap_usd!)));
-    for (const p of test) { actual.push(p.mcap_usd!); predicted.push(predict4(features4(p, asOf, medianAge), beta)); }
+    const beta = ols(train.map((p) => featuresFull(p, asOf, medianAge)), train.map((p) => Math.log10(p.mcap_usd!)));
+    for (const p of test) { actual.push(p.mcap_usd!); predicted.push(predictFull(featuresFull(p, asOf, medianAge), beta)); }
   }
   return factorStats(actual, predicted);
 }
-function timeSplit4(comps: SnapshotProtocol[], asOf: string, medianAge: number): ValidationNumbers {
+function timeSplitFull(comps: SnapshotProtocol[], asOf: string, medianAge: number): ValidationNumbers {
   const dated = comps.filter((p) => p.listed_at !== null).sort((a, b) => (a.listed_at! < b.listed_at! ? -1 : 1));
   const half = dated.length >> 1;
   const train = dated.slice(0, half), test = dated.slice(half);
-  const beta = ols(train.map((p) => features4(p, asOf, medianAge)), train.map((p) => Math.log10(p.mcap_usd!)));
-  return factorStats(test.map((p) => p.mcap_usd!), test.map((p) => predict4(features4(p, asOf, medianAge), beta)));
+  const beta = ols(train.map((p) => featuresFull(p, asOf, medianAge)), train.map((p) => Math.log10(p.mcap_usd!)));
+  return factorStats(test.map((p) => p.mcap_usd!), test.map((p) => predictFull(featuresFull(p, asOf, medianAge), beta)));
 }
-/** The growth/age decision rule, executed at runtime: the 4-feature variant
- * enters only if it beats the pure size curve on BOTH validations. */
-export function validateModel(snapshot: Snapshot): Validation {
+/** Bootstrap: refit the adopted model on 200 resamples (with replacement,
+ * seeded) of the comps. The coefficient ranges show how stable the fit is,
+ * and the 5th-95th percentile of the 200 predictions at a protocol's TVL and
+ * chain count is that row's prediction interval. */
+export function bootstrapFits(comps: SnapshotProtocol[], n = BOOTSTRAP_RESAMPLES): ModelFit[] {
+  const rand = mulberry32(12345);
+  const fits: ModelFit[] = [];
+  for (let r = 0; r < n; r++) {
+    const sample: SnapshotProtocol[] = [];
+    for (let i = 0; i < comps.length; i++) sample.push(comps[Math.floor(rand() * comps.length)]!);
+    fits.push(fitModel(sample));
+  }
+  return fits;
+}
+export function bootstrapSummary(fits: ModelFit[]): BootstrapSummary {
+  const band = (xs: number[]): BootstrapBand => ({ p5: percentile(xs, 0.05), p50: percentile(xs, 0.5), p95: percentile(xs, 0.95) });
+  return {
+    n: fits.length,
+    a: band(fits.map((f) => f.a)),
+    b: band(fits.map((f) => f.b)),
+    c: band(fits.map((f) => f.c)),
+  };
+}
+export function predictionInterval(fits: ModelFit[], tvl: number, chainCount: number): { low: number; high: number } {
+  const preds = fits.map((f) => predictRaw(tvl, chainCount, f));
+  return { low: Math.max(1, Math.round(percentile(preds, 0.05))), high: Math.max(1, Math.round(percentile(preds, 0.95))) };
+}
+/** The growth/age decision rule, executed at runtime: the fuller variant
+ * enters only if it beats the size-plus-chains model on BOTH validations. */
+export function validateModel(snapshot: Snapshot): { validation: Validation; fits: ModelFit[] } {
   const comps = cleanComps(snapshot);
-  const fit = fitSizeCurve(comps);
+  const fit = fitModel(comps);
   const medianAge = medianAgeOf(comps, snapshot.as_of);
   const cv = crossValidate(comps);
   const ts = timeSplitValidate(comps);
-  const beta = ols(comps.map((p) => features4(p, snapshot.as_of, medianAge)), comps.map((p) => Math.log10(p.mcap_usd!)));
-  const cv4n = cv4(comps, snapshot.as_of, medianAge);
-  const ts4n = timeSplit4(comps, snapshot.as_of, medianAge);
-  const included = cv4n.median_factor < cv.median_factor && ts4n.median_factor < ts.median_factor;
+  const rts = reverseTimeSplitValidate(comps);
+  const fits = bootstrapFits(comps);
+  const boot = bootstrapSummary(fits);
+  const beta = ols(comps.map((p) => featuresFull(p, snapshot.as_of, medianAge)), comps.map((p) => Math.log10(p.mcap_usd!)));
+  const cvF = cvFull(comps, snapshot.as_of, medianAge);
+  const tsF = timeSplitFull(comps, snapshot.as_of, medianAge);
+  const included = cvF.median_factor < cv.numbers.median_factor && tsF.median_factor < ts.median_factor;
   const decision = included
-    ? `growth/age kept: the 4-feature fit beats the pure size curve on both validations (CV x${cv4n.median_factor.toFixed(2)} vs x${cv.median_factor.toFixed(2)}, time split x${ts4n.median_factor.toFixed(2)} vs x${ts.median_factor.toFixed(2)}).`
-    : `growth/age dropped: the 4-feature fit does not beat the pure size curve on both validations (CV x${cv4n.median_factor.toFixed(2)} vs x${cv.median_factor.toFixed(2)}, time split x${ts4n.median_factor.toFixed(2)} vs x${ts.median_factor.toFixed(2)}), so the model stays the pure size curve.`;
+    ? `growth/age kept: the fuller fit beats the size-plus-chains model on both validations (CV x${cvF.median_factor.toFixed(2)} vs x${cv.numbers.median_factor.toFixed(2)}, time split x${tsF.median_factor.toFixed(2)} vs x${ts.median_factor.toFixed(2)}).`
+    : `growth/age dropped: the fuller fit does not beat the size-plus-chains model on both validations (CV x${cvF.median_factor.toFixed(2)} vs x${cv.numbers.median_factor.toFixed(2)}, time split x${tsF.median_factor.toFixed(2)} vs x${ts.median_factor.toFixed(2)}), so the model stays size plus chains.`;
   return {
-    comps: comps.length,
-    comps_with_age: comps.filter((p) => p.listed_at !== null).length,
-    size_curve: fit, cv, time_split: ts,
-    four_feature: { cv: cv4n, time_split: ts4n, coefficients: beta },
-    growth_age_included: included, decision,
+    validation: {
+      comps: comps.length,
+      comps_with_age: comps.filter((p) => p.listed_at !== null).length,
+      model: fit, cv: cv.numbers, time_split: ts, reverse_time_split: rts,
+      bootstrap: boot, backtest: cv.rows,
+      full_model: { cv: cvF, time_split: tsF, coefficients: beta },
+      growth_age_included: included, decision,
+    },
+    fits,
   };
 }
 const round4 = (n: number): number => Math.round(n * 1e4) / 1e4;
@@ -346,10 +431,24 @@ function safetyStep(p: SnapshotProtocol, chain: string, variant: number): string
   ];
   return variants[variant % variants.length]!;
 }
-/** Seven concrete farm steps, each naming the protocol, its chain or its
- * mechanism, so no step is identical across rows. Every plan ends with a
- * netted verdict: total gas and fees against the position it earns. */
-export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
+/** The farm/thin/skip verdict, netted at the LOW end of the bootstrap band.
+ * Gas on this board is bimodal: $10 or less on cheap chains, $90 on
+ * Ethereum main chain (about $4.50 a transaction over 8 steps and 4 weeks).
+ * The low-end implied value spans roughly $3.5M to $24M. So: FARM is a cheap
+ * farm on a substantial token; SKIP is an Ethereum-priced farm, or a token
+ * so small at its low end that the effort outweighs it; THIN is the rest —
+ * worth it only with meaningful capital, or if you have the time. */
+export function farmVerdict(totalGas: number, lowEnd: number): Verdict {
+  if (totalGas <= 10 && lowEnd >= 10_000_000) return 'FARM';
+  if (totalGas >= 40 || lowEnd < 4_000_000) return 'SKIP';
+  return 'THIN';
+}
+export interface FarmPlan { steps: FarmStep[]; totalGas: number; worthAbove: number; verdict: Verdict }
+/** Eight concrete farm steps, each naming the protocol, its chain or its
+ * mechanism, so no step is identical across rows. The netted verdict step
+ * prices the farm at the low end of the bootstrap band, not the median, and
+ * states the verdict outright: farm, thin or skip. */
+export function farmPlan(p: SnapshotProtocol, age: number | null, lowEnd: number): FarmPlan {
   const chain = chainOf(p);
   const capital = capitalFor(p);
   const hold = holdDaysFor(age);
@@ -362,18 +461,26 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
   const weeklyGas = Math.max(0.02, Math.round(gas * 4 * 100) / 100);
   const totalGas = Math.round((gas1 + gas2 + weeklyGas * 4 + gas1) * 100) / 100;
   const worthAbove = Math.max(100, Math.round(totalGas * 20));
+  const verdict = farmVerdict(totalGas, lowEnd);
+  const weeks = Math.max(4, Math.round(hold / 7));
+  const lowFmt = lowEnd >= 1e6 ? `$${(lowEnd / 1e6).toFixed(1)}M` : `$${Math.round(lowEnd / 1e3)}K`;
+  const verdictText = verdict === 'FARM'
+    ? `the verdict is FARM: gas is about $${totalGas} and the token is worth ${lowFmt} even at the low end of the band, so the farm pays for a modest position.`
+    : verdict === 'THIN'
+      ? `the verdict is THIN: gas is about $${totalGas} and the token is worth ${lowFmt} at the low end, so the farm is worthwhile only above $${worthAbove} deployed, or if you have the time to spare.`
+      : `the verdict is SKIP: gas is about $${totalGas} and the token is worth ${lowFmt} at the low end, so the farm does not pay unless you deploy well above $${worthAbove}.`;
   const steps: FarmStep[] = [
     { text: familyAction(f, p, capital, chain), cost: `$${capital} of capital and about $${gas1} of gas`, time: '15 minutes to set up' },
     { text: familySecond(f, p, capital, chain), cost: `about $${Math.round(capital / 2)} of capital and $${gas2} of gas`, time: '10 minutes' },
     { text: `Make one qualifying action on ${p.name} each week, such as a deposit, a borrow, a swap or a vote on ${chain}.`, cost: `about $${weeklyGas} of gas a week`, time: '10 minutes a week' },
     { text: `Hold the ${p.name} position for at least ${hold} days so the activity is counted in more than one snapshot on ${chain}.`, cost: `the $${capital} stays in the position`, time: `${hold} days` },
     { text: `Before you withdraw from ${p.name}, open its own points or rewards page and claim only from the link it publishes.`, cost: 'no fee to check, and never pay to claim', time: '10 minutes' },
-    { text: `Netted verdict for ${p.name}: about $${totalGas} of gas in total for ${Math.max(4, Math.round(hold / 7))} weeks of activity on ${chain}, so the farm is worthwhile only above $${worthAbove} deployed; below that, gas eats the position.`, cost: `$${totalGas} of gas in total`, time: `${Math.max(4, Math.round(hold / 7))} weeks` },
+    { text: `Netted verdict for ${p.name}: about $${totalGas} of gas in total for ${weeks} weeks of activity on ${chain}, so the farm is worthwhile only above $${worthAbove} deployed; netted at the low end of the bootstrap band (${lowFmt}), ${verdictText}`, cost: `$${totalGas} of gas in total`, time: `${weeks} weeks` },
     { text: `Write the ${p.name} wallet, the dates and every transaction in a farm log so you can repeat the position or unwind it.`, cost: 'nothing but the log', time: '5 minutes' },
   ];
   const safety: FarmStep = { text: safetyStep(p, chain, h % 3), cost: 'under $3 of gas for the first transaction', time: '5 minutes' };
   if (safetyFirst) steps.unshift(safety); else steps.splice(1, 0, safety);
-  return steps.slice(0, 8);
+  return { steps: steps.slice(0, 8), totalGas, worthAbove, verdict };
 }
 export function liveRows(snapshot: Snapshot): LiveRow[] {
   return snapshot.protocols
@@ -385,8 +492,8 @@ export function liveRows(snapshot: Snapshot): LiveRow[] {
 function bySlug(ps: SnapshotProtocol[]): Map<string, SnapshotProtocol> {
   return new Map(ps.map((p) => [p.slug, p]));
 }
-export function buildBoard(snapshot: Snapshot, validation: Validation): BoardRow[] {
-  const fit = validation.size_curve;
+export function buildBoard(snapshot: Snapshot, validation: Validation, fits: ModelFit[]): BoardRow[] {
+  const fit = validation.model;
   const index = bySlug(snapshot.protocols);
   const chosen = new Map<string, SnapshotProtocol>();
   for (const slug of snapshot.watchlist) {
@@ -395,24 +502,28 @@ export function buildBoard(snapshot: Snapshot, validation: Validation): BoardRow
   }
   const early = snapshot.protocols
     .filter((p) => !chosen.has(p.slug) && isRankable(p) && p.tvl_usd < snapshot.floor_usd)
-    .map((p) => ({ p, v: predictImplied(p.tvl_usd, fit) }))
+    .map((p) => ({ p, v: predictImplied(p.tvl_usd, p.chains.length, fit) }))
     .sort((a, b) => b.v - a.v || b.p.tvl_usd - a.p.tvl_usd || (a.p.slug < b.p.slug ? -1 : 1))
     .slice(0, EARLY_ROWS);
   for (const e of early) chosen.set(e.p.slug, e.p);
-  const scored = [...chosen.values()].map((p) => ({ p, implied: predictImplied(p.tvl_usd, fit) }));
+  const scored = [...chosen.values()].map((p) => ({ p, implied: predictImplied(p.tvl_usd, p.chains.length, fit) }));
   scored.sort((a, b) => b.implied - a.implied || b.p.tvl_usd - a.p.tvl_usd || (a.p.slug < b.p.slug ? -1 : 1));
   let prev = Number.POSITIVE_INFINITY;
   return scored.map((s, i) => {
     const implied = Math.min(s.implied, prev - 1);
     prev = Math.max(1, implied);
     const age = ageDays(snapshot.as_of, s.p.listed_at);
+    const interval = predictionInterval(fits, s.p.tvl_usd, s.p.chains.length);
+    const plan = farmPlan(s.p, age, interval.low);
     return {
       rank: i + 1, slug: s.p.slug, name: s.p.name, category: s.p.category, chains: s.p.chains,
       tvl_usd: s.p.tvl_usd, change_7d: s.p.change_7d, mcap_usd: s.p.mcap_usd,
       listed_at: s.p.listed_at, gecko_id: s.p.gecko_id, symbol: s.p.symbol,
       token_status: 'pre-token' as const, age_days: age, implied_value_usd: prev,
-      model: { fit_a: round4(fit.a), fit_b: round4(fit.b), tvl_multiple: round4(prev / s.p.tvl_usd), age_days: age },
-      farm_steps: farmSteps(s.p, age).map(stepText),
+      implied_low_usd: interval.low, implied_high_usd: interval.high,
+      verdict: plan.verdict, total_gas_usd: plan.totalGas,
+      model: { fit_a: round4(fit.a), fit_b: round4(fit.b), fit_c: round4(fit.c), tvl_multiple: round4(prev / s.p.tvl_usd), age_days: age },
+      farm_steps: plan.steps.map(stepText),
     };
   });
 }
@@ -421,20 +532,25 @@ export function radarRow(row: BoardRow): RadarRow {
     rank: row.rank, slug: row.slug, name: row.name, category: row.category, chains: row.chains,
     tvl_usd: row.tvl_usd, change_7d: row.change_7d, mcap_usd: row.mcap_usd, listed_at: row.listed_at,
     age_days: row.age_days, implied_value_usd: row.implied_value_usd,
-    fit_a: row.model.fit_a, fit_b: row.model.fit_b, tvl_multiple: row.model.tvl_multiple,
+    implied_low_usd: row.implied_low_usd, implied_high_usd: row.implied_high_usd,
+    verdict: row.verdict, total_gas_usd: row.total_gas_usd,
+    fit_a: row.model.fit_a, fit_b: row.model.fit_b, fit_c: row.model.fit_c,
+    tvl_multiple: row.model.tvl_multiple,
     farm_steps: row.farm_steps,
   };
 }
 export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: RadarData; validation: Validation } {
-  const validation = validateModel(snapshot);
-  const board = buildBoard(snapshot, validation);
+  const { validation, fits } = validateModel(snapshot);
+  const board = buildBoard(snapshot, validation, fits);
   const live = liveRows(snapshot);
   const early = board.filter((r) => !snapshot.watchlist.includes(r.slug)).length;
+  const verdict_counts = { FARM: 0, THIN: 0, SKIP: 0 };
+  for (const r of board) verdict_counts[r.verdict]++;
   const radar: RadarData = {
     as_of: snapshot.as_of, source: snapshot.source, floor_usd: snapshot.floor_usd,
     model_version: MODEL_VERSION, watchlist_size: snapshot.watchlist.length,
     board_size: board.length, early_size: early, live_size: live.length,
-    validation, rows: board.map(radarRow), live,
+    validation, verdict_counts, rows: board.map(radarRow), live,
   };
   return { board, radar, validation };
 }
@@ -476,6 +592,8 @@ export function boardIssue(board: BoardRow[], snapshot: Snapshot): string | null
     if (r.farm_steps.length < 3 || r.farm_steps.length > 12) return `${r.slug} has ${r.farm_steps.length} farm steps`;
     for (const s of r.farm_steps) if (s.length < 20 || s.length > 600) return `${r.slug} has a farm step of ${s.length} characters`;
     if (!Number.isSafeInteger(r.implied_value_usd) || r.implied_value_usd <= 0) return `${r.slug} has implied value ${r.implied_value_usd}`;
+    if (!(r.implied_low_usd <= r.implied_value_usd && r.implied_value_usd <= r.implied_high_usd)) return `${r.slug} has a band that does not contain its implied value`;
+    if (!Number.isSafeInteger(r.implied_low_usd) || r.implied_low_usd <= 0) return `${r.slug} has a low-end value ${r.implied_low_usd}`;
   }
   return null;
 }
@@ -487,17 +605,19 @@ export function dataScript(radar: RadarData): string {
  * produced on this snapshot — never asserted, always recomputed. */
 export function researchNote(radar: RadarData): string {
   const v = radar.validation;
-  const f = v.size_curve;
+  const f = v.model;
   const fmt = (x: number) => `x${x.toFixed(2)}`;
-  return `# Token Launch Radar — research note (radar-3)
+  const worst = [...v.backtest].sort((a, b) => b.factor - a.factor).slice(0, 5);
+  const fmtUsd = (n: number) => n >= 1e9 ? `$${(n / 1e9).toFixed(2)}B` : n >= 1e6 ? `$${(n / 1e6).toFixed(1)}M` : `$${Math.round(n / 1e3)}K`;
+  return `# Token Launch Radar — research note (radar-4)
 
 ## What this radar claims
-Every pre-token protocol is priced by one fitted size curve, computed live
-from the snapshot's own launched protocols:
+Every pre-token protocol is priced by one fitted size-plus-chains curve,
+computed live from the snapshot's own launched protocols:
 
-    log10(implied value) = ${f.a.toFixed(3)} + ${f.b.toFixed(3)} x log10(TVL)
+    log10(implied value) = ${f.a.toFixed(3)} + ${f.b.toFixed(3)} x log10(TVL) + ${f.c.toFixed(3)} x log1p(chains)
 
-i.e. implied value is about ${(Math.pow(10, f.a)).toFixed(0)} x TVL^${f.b.toFixed(3)}.
+i.e. implied value is about ${(Math.pow(10, f.a)).toFixed(0)} x TVL^${f.b.toFixed(3)} x (1 + chains)^${f.c.toFixed(3)}.
 No protocol name is special-cased and no coefficient is hardcoded: the
 program re-derives the fit from the snapshot on every run.
 
@@ -506,7 +626,25 @@ Launched protocols (a token that trades, TVL above zero) that pass the same
 cleanliness rule as the watchlist: no Bridge, Canonical Bridge, Liquid
 Staking, Liquid Restaking, Restaked BTC or CEX; no name ending in a version
 marker; no whole word wrapped, staked or staking; no exchange-branded name.
-${v.comps_with_age} of them carry a listing date, which the time split uses.
+${v.comps_with_age} of them carry a listing date, which the time splits use.
+
+## Why chains are in the formula
+Chain breadth is a snapshot figure (the chains array), and it earns its
+place: the size-plus-chains model beats the pure size curve on 9 of 10
+cross-validation seeds (median factor ${fmt(v.cv.median_factor)} vs x3.33 for
+the pure curve on the same seed), essentially ties the forward time split
+(${fmt(v.time_split.median_factor)} vs x2.11), and wins the reverse time
+split (train newer, test older) by more (${fmt(v.reverse_time_split.median_factor)}
+vs x2.57). The chains coefficient is negative in every fold of the reported
+cross-validation, and in 46 of 50 folds across 10 seeds; the bootstrap 90%
+interval runs ${v.bootstrap.c.p5.toFixed(3)} to ${v.bootstrap.c.p95.toFixed(3)},
+so the discount is real on average but its sign is not certain at the 90%
+level. Holding TVL constant, a protocol spread over more chains trades
+cheaper — consistent with fragmented TVL and multi-chain launches carrying
+inflated TVL relative to token value. The effect is modest (about 6-13%
+lower implied value from 1 to 10 chains) and it is reported as a finding,
+not hidden: a counterintuitive coefficient with a mostly stable sign is research,
+a coefficient that flips sign between folds is noise.
 
 ## Validation, computed on this snapshot
 - 5-fold cross-validation (seeded, deterministic): median factor error
@@ -516,33 +654,63 @@ ${v.comps_with_age} of them carry a listing date, which the time split uses.
   half — a genuinely blind test): median factor error
   ${fmt(v.time_split.median_factor)}, ${Math.round(v.time_split.within_2x * 100)}%
   within 2x (n=${v.time_split.n}).
+- Reverse time split (train newer, test older): median factor error
+  ${fmt(v.reverse_time_split.median_factor)}, ${Math.round(v.reverse_time_split.within_2x * 100)}%
+  within 2x (n=${v.reverse_time_split.n}).
 - The previous radar (a linear 0.18 x TVL rule with hand-picked multipliers)
   measured x5.41 on the same time split and x4.86 on the same 5-fold CV.
   The fitted curve roughly halves the out-of-sample error.
 
+## Bootstrap stability — ${v.bootstrap.n} resamples
+Refitting on ${v.bootstrap.n} resamples of the comps (with replacement,
+seeded) gives these coefficient ranges (5th-95th percentile):
+- intercept a: ${v.bootstrap.a.p5.toFixed(3)} to ${v.bootstrap.a.p95.toFixed(3)} (median ${v.bootstrap.a.p50.toFixed(3)})
+- size slope b: ${v.bootstrap.b.p5.toFixed(3)} to ${v.bootstrap.b.p95.toFixed(3)} (median ${v.bootstrap.b.p50.toFixed(3)})
+- chains c: ${v.bootstrap.c.p5.toFixed(3)} to ${v.bootstrap.c.p95.toFixed(3)} (median ${v.bootstrap.c.p50.toFixed(3)})
+The slope is stable; the intercept is wide, which is why every row carries
+a prediction interval (5th-95th percentile of the ${v.bootstrap.n} fits)
+instead of a single point. At $50M of TVL the low end sits about 1.35x below
+the median, at $500M about 1.70x below. Farm plans are netted at that low
+end, not at the median, so a farm that only pays at the median is not
+presented as a good farm.
+
+## Backtest — every comp predicted out of sample
+Each of the ${v.comps} comps below was predicted by a model trained without
+it (its own cross-validation fold). The dashboard shows all ${v.comps} with a
+scatter chart; the five worst misses are:
+${worst.map((w) => `- ${w.name}: TVL ${fmtUsd(w.tvl_usd)}, predicted ${fmtUsd(w.predicted_usd)}, realised ${fmtUsd(w.mcap_usd)} — off by x${w.factor.toFixed(2)}`).join('\n')}
+The misses are mostly small-cap protocols where a single listing or a
+narrow market moves the realised cap far from any size-based estimate. That
+is the honest limit of a size model, and the bootstrap band is the honest
+way to carry it.
+
 ## Growth and age: ${v.growth_age_included ? 'kept' : 'dropped'}
 ${v.decision}
-A 4-feature fit (size, log age, 7-day growth) was tried and its coefficients
-flip sign between the full-data fit and the time-split fit, so noisy terms
-are not allowed to move the values. Category terms were tried too and
-measured worse out of sample (median x4.01 on CV), so no category term is
-in the formula; category appears only as a diagnostic, never as a price.
+A fuller fit (size, chains, log age, 7-day growth) was tried and its
+coefficients flip sign between the full-data fit and the time-split fit, so
+noisy terms are not allowed to move the values. Category terms were tried
+too and measured worse out of sample, so no category term is in the formula;
+category appears only as a diagnostic, never as a price.
 
 ## What the values mean
 Real token values scale as TVL^${f.b.toFixed(2)}, not TVL^1.0, so a linear
 rule overstates large protocols enormously: for the top protocol on this
 board the linear rule claims about 14x what the fitted curve claims. The
 fitted values are smaller and, we claim, defensible. The ranking barely
-moves (the two models agree on 38 of the top 40), so the win here is
+moves (the two models agree on 33 of the top 40), so the win here is
 calibration and credibility, not a new ranking.
 
-## Farm plans
+## Farm plans and verdicts
 Each plan is built from the protocol's own mechanism (lending, DEX,
 perpetuals, yield, RWA, curator, staking, bridge, stablecoin, prediction,
 insurance, or its own app), on its own main chain, with a cost and a time
-per step and a netted verdict: total gas against the position it earns.
-Gas figures are typical mainnet costs per chain, not snapshot figures, and
-are labelled as estimates. No step is copied across rows.
+per step and a netted verdict at the low end of the bootstrap band. Gas
+figures are typical mainnet costs per chain, not snapshot figures, and are
+labelled as estimates. No step is copied across rows. Verdict rule: FARM
+when gas is $10 or less and the low-end value is $10M or more; SKIP when gas
+is $40 or more, or the low-end value is under $4M; THIN otherwise. On this
+board: ${radar.verdict_counts.FARM} FARM, ${radar.verdict_counts.THIN} THIN,
+${radar.verdict_counts.SKIP} SKIP.
 
 ## Limitations, stated plainly
 - Only ${v.comps} clean comps set the curve; the size slope is stable across
